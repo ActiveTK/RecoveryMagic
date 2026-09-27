@@ -4,18 +4,18 @@ use dokan::{
     CreateFileInfo, DiskSpaceInfo, FileInfo as DokanFileInfo, FileSystemHandler, FileTimeOperation,
     FillDataError, FillDataResult, FindData, OperationInfo, OperationResult, VolumeInfo,
 };
-use ntfs_reader::{api::NtfsAttributeType, mft::Mft, volume::Volume};
+use ntfs_reader::{Mft, NtfsReaderError, Volume};
 use parking_lot::RwLock;
 use std::collections::BTreeSet;
-use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tracing::debug;
 use widestring::{U16CStr, U16CString, U16Str, U16String};
 use winapi::shared::ntstatus::{
-    STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_NOT_IMPLEMENTED, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW, STATUS_DATA_ERROR, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_IO_DEVICE_ERROR, STATUS_NOT_IMPLEMENTED, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use winapi::um::winnt::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY};
 
@@ -32,7 +32,6 @@ pub struct UnUnlinkFs {
     pub _device_path: String,
     pub volume: Volume,
     pub mft: Mft,
-    pub dev_reader: File,
     pub index: Arc<RwLock<DeletedIndex>>,
 }
 
@@ -41,14 +40,12 @@ impl UnUnlinkFs {
         device_path: String,
         volume: Volume,
         mft: Mft,
-        dev_reader: File,
         index: Arc<RwLock<DeletedIndex>>,
     ) -> Self {
         Self {
             _device_path: device_path,
             volume,
             mft,
-            dev_reader,
             index,
         }
     }
@@ -80,14 +77,73 @@ impl UnUnlinkFs {
         })
     }
 
-    fn read_all_data(&self, mft_no: u64) -> Vec<u8> {
-        let rec: &[u8] = self.mft.get_record_data(mft_no);
-        Mft::read_data_fs(
-            &self.volume,
-            &mut self.dev_reader.try_clone().unwrap(),
-            rec,
-            NtfsAttributeType::Data,
-        )
+    // ntfs-reader 0.5.2 restores non-resident reads via NtfsFile::open_stream, a Read + Seek
+    // StreamReader over the default stream (live or deleted, resident or not). Seek to `offset`
+    // and read only what the caller asked for, instead of loading the whole file into memory.
+    fn read_all_data(&self, mft_no: u64, offset: i64, buffer: &mut [u8]) -> OperationResult<u32> {
+        let file = self
+            .mft
+            .record(mft_no)
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let mut stream = file.open_stream(None).map_err(map_open_stream_error)?;
+        if stream.data_lost() {
+            // Deleted file with an $ATTRIBUTE_LIST: NTFS zeroed the non-resident stream's size
+            // and cluster list on delete, so there is nothing left to locate.
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        let size = stream.size();
+        let off = if offset < 0 { 0 } else { offset as u64 };
+        if off >= size {
+            return Ok(0);
+        }
+        stream
+            .seek(SeekFrom::Start(off))
+            .map_err(|_| STATUS_IO_DEVICE_ERROR)?;
+        let want = std::cmp::min(buffer.len() as u64, size - off) as usize;
+        let mut total = 0usize;
+        while total < want {
+            match stream.read(&mut buffer[total..want]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                // A missing extent (a deleted file's extension record was freed and reused)
+                // still leaves the bytes read before it usable; anything else is a hard error
+                // only when nothing at all came back.
+                Err(_) if total > 0 => break,
+                Err(err) => return Err(map_stream_read_error(&err)),
+            }
+        }
+        if off == 0 {
+            // 先頭オフセットから読み出した結果が全部ゼロなら、既にTRIMコマンドで消されてしまったとみなす
+            if total > 0 && !buffer[..total].iter().any(|&b| b != 0) {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
+        }
+        Ok(total as u32)
+    }
+}
+
+// StreamNotFound is treated like a missing file, the compressed/encrypted/WOF cases like
+// unsupported operations (this crate does not decompress or decrypt), and anything else (e.g.
+// InvalidDataRun) as a data error.
+fn map_open_stream_error(err: NtfsReaderError) -> i32 {
+    match err {
+        NtfsReaderError::StreamNotFound { .. } => STATUS_OBJECT_NAME_NOT_FOUND,
+        NtfsReaderError::CompressedStream
+        | NtfsReaderError::EncryptedStream
+        | NtfsReaderError::WofCompressedStream => STATUS_NOT_IMPLEMENTED,
+        _ => STATUS_DATA_ERROR,
+    }
+}
+
+// NtfsReaderError::StreamExtentMissing travels inside the io::Error a StreamReader read
+// returns; anything else is a genuine I/O failure.
+fn map_stream_read_error(err: &std::io::Error) -> i32 {
+    match err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<NtfsReaderError>())
+    {
+        Some(NtfsReaderError::StreamExtentMissing { .. }) => STATUS_DATA_ERROR,
+        _ => STATUS_IO_DEVICE_ERROR,
     }
 }
 
@@ -441,23 +497,10 @@ impl<'a> FileSystemHandler<'a, 'a> for UnUnlinkFs {
         };
 
         // panicが発生してもシステムクラッシュしないようにcatch_unwindで囲む
-        let data =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.read_all_data(mft_no)))
-                .map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
-        let off = if offset < 0 { 0 } else { offset as usize };
-        if off >= data.len() {
-            return Ok(0);
-        }
-        let max = std::cmp::min(buffer.len(), data.len() - off);
-        let slice = &data[off..off + max];
-        if off == 0 {
-            // 先頭オフセットから読み出した結果が全部ゼロなら、既にTRIMコマンドで消されてしまったとみなす
-            if !slice.iter().any(|&b| b != 0) {
-                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-            }
-        }
-        buffer[..max].copy_from_slice(slice);
-        Ok(max as u32)
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.read_all_data(mft_no, offset, buffer)
+        }))
+        .map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?
     }
 
     fn set_file_time(
