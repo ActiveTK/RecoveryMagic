@@ -15,7 +15,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 num_cpus = "1.16"
 
-ntfs-reader = "0.3"
+ntfs-reader = "0.5.3"
 widestring = "0.4.3"
 winapi = { version = "0.3", features = ["winnt", "fileapi", "handleapi",
   "shellapi",

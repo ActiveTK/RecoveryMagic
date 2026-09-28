@@ -5,10 +5,9 @@ use crate::scan::{CANCEL, indexer_worker, progress_loop_emit, start_scanner_pool
 use crate::util::{humanize_bytes, normalize_device};
 use anyhow::{Context, Result};
 use dokan::{FileSystemMounter, MountOptions, shutdown, unmount};
-use ntfs_reader::{mft::Mft, volume::Volume};
+use ntfs_reader::{FIRST_NORMAL_RECORD, Mft, Volume};
 use parking_lot::RwLock;
 use serde::Serialize;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -142,14 +141,12 @@ fn do_mount(letter: String, app: AppHandle) -> Result<()> {
     let volume = Volume::new(&device).with_context(|| format!("failed to open {}", device))?;
     let mft_for_scan = Mft::new(volume.clone()).context("failed to open $MFT for scan")?;
     let shared_mft = Arc::new(RwLock::new(mft_for_scan));
-    let max_record = { shared_mft.read().max_record as u64 };
+    let max_record = { shared_mft.read().record_count() };
     {
-        let _ = shared_mft
-            .read()
-            .get_record(ntfs_reader::api::FIRST_NORMAL_RECORD);
+        let _ = shared_mft.read().record(FIRST_NORMAL_RECORD);
     }
 
-    let total_records = (max_record - ntfs_reader::api::FIRST_NORMAL_RECORD as u64) as u64;
+    let total_records = max_record - FIRST_NORMAL_RECORD;
     let processed = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
@@ -186,18 +183,10 @@ fn do_mount(letter: String, app: AppHandle) -> Result<()> {
         .map(|rw| rw.into_inner())
         .unwrap_or_else(|_| panic!("shared_mft still has strong refs at FS handoff"));
 
-    let dev_reader = File::options()
-        .read(true)
-        .open(&device)
-        .with_context(|| format!("open device for Data attribute: {}", device))?;
+    // ntfs-reader 0.5.2's NtfsFile::open_stream opens its own volume handle lazily, so
+    // UnUnlinkFs no longer needs a device handle of its own for reading file data.
     let idx_arc = Arc::new(RwLock::new(built_index));
-    let fs = UnUnlinkFs::new(
-        device.clone(),
-        volume,
-        mft_for_fs,
-        dev_reader,
-        idx_arc.clone(),
-    );
+    let fs = UnUnlinkFs::new(device.clone(), volume, mft_for_fs, idx_arc.clone());
 
     let mut flags = dokan::MountFlags::ALT_STREAM | dokan::MountFlags::REMOVABLE;
     #[cfg(debug_assertions)]

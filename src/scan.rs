@@ -1,8 +1,6 @@
 use crate::indexer::{apply_staging, Candidate, DeletedIndex};
 use crossbeam_channel::{Receiver, Sender};
-use ntfs_reader::api::FIRST_NORMAL_RECORD;
-use ntfs_reader::file_info::{FileInfo, VecCache};
-use ntfs_reader::mft::Mft;
+use ntfs_reader::{DeletedPathCache, DeletedPathMarker, FIRST_NORMAL_RECORD, FileInfo, Mft};
 use parking_lot::RwLock;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -12,6 +10,19 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 
 pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// The name of the folder under the reserved `_unresolved` top-level container that an
+/// incomplete `DeletedPath`'s real names are placed under, in place of the marker's `<...>`
+/// text (illegal in a Win32 name; see the ntfs-reader 0.5.3 CHANGELOG). `Lost`'s record number
+/// needs no sanitizing: a bare integer is already a legal Win32 name component.
+fn marker_container_name(marker: DeletedPathMarker) -> String {
+    match marker {
+        DeletedPathMarker::Lost(record_number) => format!("lost {record_number}"),
+        DeletedPathMarker::Deleted => "renamed on delete".to_string(),
+        DeletedPathMarker::TooLong => "path too long".to_string(),
+        _ => "unresolved".to_string(),
+    }
+}
 
 pub fn start_scanner_pool(
     shared_mft: Arc<RwLock<Mft>>,
@@ -28,7 +39,7 @@ pub fn start_scanner_pool(
             threads = v.max(1);
         }
     }
-    let start = FIRST_NORMAL_RECORD as u64;
+    let start = FIRST_NORMAL_RECORD;
     let end = max_record;
     let span = (end - start + threads as u64 - 1) / threads as u64;
     let mut handles = Vec::with_capacity(threads);
@@ -42,23 +53,54 @@ pub fn start_scanner_pool(
         let tx_cloned = tx.clone();
         let processed_cloned = processed.clone();
         let h = std::thread::spawn(move || {
-            let mut cache = VecCache::default();
+            // Only deleted files are ever turned into candidates, so a live DefaultPathCache is
+            // never needed here; a DeletedPathCache is, shared for the thread's whole range so
+            // each freed directory on the way is walked about once (see the paths-and-caches
+            // guide).
+            let mut deleted_cache = DeletedPathCache::new();
             for number in range_start..range_end {
                 if CANCEL.load(Ordering::Relaxed) {
                     break;
                 }
                 let cand_opt = {
                     let mft_read = mft_arc.read();
-                    if let Some(file) = mft_read.get_record(number) {
-                        if file.is_used() {
-                            processed_cloned.fetch_add(1, Ordering::Relaxed);
+                    if let Some(file) = mft_read.record(number) {
+                        processed_cloned.fetch_add(1, Ordering::Relaxed);
+                        // is_deleted() is the correct test (0.5.2 CHANGELOG): unlike !is_used(),
+                        // it excludes a freed extension record of a live file, and excluding
+                        // is_extension() here in turn avoids yielding a deleted file's own
+                        // extension records as separate candidates.
+                        if !file.is_deleted() || file.is_extension() {
                             None
                         } else {
-                            let infox = FileInfo::with_cache(&mft_read, &file, &mut cache);
-                            processed_cloned.fetch_add(1, Ordering::Relaxed);
+                            let infox = FileInfo::with_caches(&file, &mut (), &mut deleted_cache);
+                            // FileInfo::path is Some only for a *complete* deleted path; fall
+                            // back to Mft::resolve_deleted_path's own path, so a file under a
+                            // freed directory still gets a place in the tree instead of being
+                            // dropped (0.3 walked freed parents too). ntfs-reader 0.5.3 stopped
+                            // putting the marker's `<...>` text inside DeletedPath::path (`<` and
+                            // `>` are illegal in a Win32 name, so the old text form could not be
+                            // recreated on disk); an incomplete path is routed under the reserved
+                            // `_unresolved` top-level folder, keyed by marker, instead.
+                            let path = file
+                                .best_name()
+                                .map(|name| {
+                                    let dp =
+                                        mft_read.resolve_deleted_path(&name, &mut deleted_cache);
+                                    if dp.is_complete() {
+                                        dp.path.display().to_string()
+                                    } else {
+                                        let container =
+                                            marker_container_name(dp.marker.expect(
+                                                "is_complete() is false, so marker is Some",
+                                            ));
+                                        format!(r"_unresolved\{container}\{}", dp.path.display())
+                                    }
+                                })
+                                .unwrap_or_default();
                             Some(Candidate {
                                 mft_no: number,
-                                path: infox.path.display().to_string(),
+                                path,
                                 size: infox.size,
                                 is_dir: file.is_directory(),
                                 created: infox.created.map(|t| t.unix_timestamp()),
